@@ -6,17 +6,17 @@ import (
 	"log"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/rs/cors"
 	_ "modernc.org/sqlite"
 )
 
 type Event struct {
-	ID      int       `json:"id"`
-	Date    time.Time `json:"date"`
-	Content string    `json:"content"`
-	Mood    string    `json:"mood"`
+	ID      int    `json:"id"`
+	Date    string `json:"date"`
+	Content string `json:"content"`
+	Mood    string `json:"mood"`
 }
 
 var db *sql.DB
@@ -36,8 +36,16 @@ func main() {
 	r.HandleFunc("/events", addEvent).Methods("POST")
 	r.HandleFunc("/events/{id}", updateEvent).Methods("PUT")
 
+	c := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{"*"},
+	})
+
+	handler := c.Handler(r)
+
 	log.Println("Server starting on port 8080...")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }
 
 func createTable() {
@@ -56,7 +64,7 @@ func createTable() {
 }
 
 func getEvents(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, date, content, mood FROM events")
+	rows, err := db.Query("SELECT id, date, content, mood FROM events ORDER BY date DESC")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -66,13 +74,11 @@ func getEvents(w http.ResponseWriter, r *http.Request) {
 	var events []Event
 	for rows.Next() {
 		var e Event
-		var dateStr string
-		err := rows.Scan(&e.ID, &dateStr, &e.Content, &e.Mood)
+		err := rows.Scan(&e.ID, &e.Date, &e.Content, &e.Mood)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		e.Date, _ = time.Parse("2006-01-02", dateStr)
 		events = append(events, e)
 	}
 
@@ -83,19 +89,48 @@ func addEvent(w http.ResponseWriter, r *http.Request) {
 	var e Event
 	err := json.NewDecoder(r.Body).Decode(&e)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "Error decoding JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	result, err := db.Exec("INSERT INTO events (date, content, mood) VALUES (?, ?, ?)",
-		e.Date.Format("2006-01-02"), e.Content, e.Mood)
+	log.Printf("Received event: %+v", e)
+
+	dateStr := e.Date
+
+	var existingID int
+	err = db.QueryRow("SELECT id FROM events WHERE date = ?", dateStr).Scan(&existingID)
+	
+	if err == sql.ErrNoRows {
+		result, err := db.Exec("INSERT INTO events (date, content, mood) VALUES (?, ?, ?)",
+			dateStr, e.Content, e.Mood)
+		if err != nil {
+			http.Error(w, "Error inserting event: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		id, _ := result.LastInsertId()
+		e.ID = int(id)
+	} else if err != nil {
+		http.Error(w, "Error checking for existing event: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else {
+		_, err = db.Exec("UPDATE events SET content = ?, mood = ? WHERE id = ?",
+			e.Content, e.Mood, existingID)
+		if err != nil {
+			http.Error(w, "Error updating event: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		e.ID = existingID
+	}
+
+	err = db.QueryRow("SELECT id, date, content, mood FROM events WHERE id = ?", e.ID).Scan(&e.ID, &dateStr, &e.Content, &e.Mood)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Error retrieving event: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	id, _ := result.LastInsertId()
-	e.ID = int(id)
+	log.Printf("Event to be returned: %+v", e)
+
 	json.NewEncoder(w).Encode(e)
 }
 
@@ -117,7 +152,7 @@ func updateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err = db.Exec("UPDATE events SET date = ?, content = ?, mood = ? WHERE id = ?",
-		e.Date.Format("2006-01-02"), e.Content, e.Mood, idInt)
+		e.Date, e.Content, e.Mood, idInt)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
